@@ -352,16 +352,6 @@ kubelet-setup:
 {%- set all_masters = salt.saltutil.runner('mine.get', tgt='G@roles:kube-master', fun='network.interfaces', tgt_type='compound').keys() %}
 {%- set super_master = all_masters|first %}
 
-# we must start CNI right after the masters/minions reach highstate,
-# as nodes will be NotReady until the CNI DaemonSet is loaded and running...
-cni-setup:
-  salt.state:
-    - tgt: {{ super_master }}
-    - sls:
-      - cni
-    - require:
-      - kubelet-setup
-
 # (re-)apply all the manifests
 # this will perform a rolling-update for existing daemonsets
 services-setup:
@@ -369,11 +359,13 @@ services-setup:
     - tgt: {{ super_master }}
     - sls:
       - addons
+      - addons.psp
+      - cni
       - addons.dns
       - addons.tiller
       - addons.dex
     - require:
-      - cni-setup
+      - kubelet-setup
 
 # Remove the now defuct caasp_fqdn grain (Remove for 4.0).
 remove-caasp-fqdn-grain:

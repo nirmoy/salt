@@ -1,0 +1,82 @@
+# The lockdown PodSecurityPolicy is intended to be as locked
+# down as is possible. It's likely to be so restrictive as to not generally
+# be usable.
+---
+apiVersion: extensions/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: lockdown
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default
+    seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
+    apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
+    apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
+spec:
+  # Privileged
+  privileged: false
+  # Volumes and File Systems
+  volumes:
+    # Kubernetes Pseudo Volume Types
+    - configMap
+    - secret
+    - emptyDir
+    - downwardAPI
+    - projected
+    - persistentVolumeClaim
+  allowedFlexVolumes: []
+  allowedHostPaths:
+    # Note: We don't allow hostPath volumes above, but set this to a path we
+    # control anyway as a belt+braces protection. /dev/null may be a better
+    # option, but the implications of pointing this towards a device are
+    # unclear.
+    - pathPrefix: /opt/kubernetes-hostpath-volumes
+  readOnlyRootFilesystem: true
+  # Users and groups
+  runAsUser:
+    rule: MustRunAs
+    ranges:
+      # nobody
+      - min: 65534
+        max: 65534
+  supplementalGroups:
+    rule: MustRunAs
+    ranges:
+      # nobody
+      - min: 65534
+        max: 65534
+  fsGroup:
+    rule: MustRunAs
+    ranges:
+      # nobody
+      - min: 65534
+        max: 65534
+  # Privilege Escalation
+  allowPrivilegeEscalation: false
+  defaultAllowPrivilegeEscalation: false
+  # Capabilities
+  allowedCapabilities: []
+  defaultAddCapabilities: []
+  requiredDropCapabilities:
+    - ALL
+  # Host namespaces
+  hostPID: false
+  hostIPC: false
+  hostNetwork: false
+  hostPorts:
+    # No privileged ports, no registered ports
+    - min: 49152
+      max: 65535
+  seLinux:
+    # SELinux is unsed in CaaSP
+    rule: 'RunAsAny'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: suse:caasp:psp:lockdown
+rules:
+  - apiGroups: ['extensions']
+    resources: ['podsecuritypolicies']
+    verbs: ['use']
+    resourceNames:
+      - suse:caasp:psp:lockdown
