@@ -16,14 +16,6 @@ def __virtual__():
     return "caasp_etcd"
 
 
-# Grain used for getting nodes
-_GRAIN_NAME = 'nodename'
-
-
-class OnlyOnMasterException(Exception):
-    pass
-
-
 class NoEtcdServersException(Exception):
     pass
 
@@ -39,19 +31,8 @@ def _optimal_etcd_number(num_nodes):
         return 1
 
 
-def _get_grain(expr, grain=_GRAIN_NAME, type='compound'):
-    if __opts__['__role'] == 'master':
-        # 'mine.get' is not available in the master: it returns nothing
-        # in that case, we should use "saltutil.runner"... uh?
-        return __salt__['saltutil.runner']('mine.get',
-                                           tgt=expr,
-                                           fun=grain, tgt_type=type)
-    else:
-        return __salt__['mine.get'](expr, grain, expr_form=type)
-
-
 def _get_this_name():
-    return __salt__['grains.get'](_GRAIN_NAME)
+    return __salt__['grains.get']('nodename')
 
 
 def _get_num_kube(expr):
@@ -59,7 +40,7 @@ def _get_num_kube(expr):
     Get the number of kubernetes nodes that in the cluster that match "expr"
     '''
     log.debug("CaaS: finding nodes that match '%s' in the cluster", expr)
-    return len(_get_grain(expr, type='grain').values())
+    return len(__salt__['caasp_grains.get'](expr, type='grain').values())
 
 
 def get_cluster_size():
@@ -111,48 +92,62 @@ def get_cluster_size():
     return member_count
 
 
-def get_replacement_for_member():
+def get_nodes_for_etcd(num, excluded=[]):
     '''
-    Get a node that can replace a etcd member
+    Get a list of `num` nodes that could be used for
+    running an etcd server.
 
-    A valid replacement is a node that:
+    A valid node is a node that:
 
-      1) is not 'admin' or 'ca'
-      2) is not an etcd member
-      2) is not going to be removed/added/updated
-      3) (in preference order)
+      1) is not the `admin` or `ca`
+      2) has no `etcd` role
+      2) is not being removed/added/updated
+      3) (in preference order, first for non bootstrapped nodes)
           1) has no role assigned
           2) is a master
           3) is a minion
-
-    Returns '' if no replacement can be found.
     '''
+    const_expr = ''
+    const_expr += 'not G@roles:etcd'
+    const_expr += ' and not G@roles:admin and not G@roles:ca'
+    const_expr += ' and not G@bootstrap_in_progress:true'
+    const_expr += ' and not G@update_in_progress:true'
+    const_expr += ' and not G@removal_in_progress:true'
+    const_expr += ' and not G@addition_in_progress:true'
 
-    prio_roles = ['not G@roles:kube-(master|minion)',
+    prio_roles = ['not P@roles:kube-(master|minion) and not G@bootstrap_complete:true',
+                  'not P@roles:kube-(master|minion)',
+                  'G@roles:kube-master and not G@bootstrap_complete:true',
                   'G@roles:kube-master',
+                  'G@roles:kube-minion and not G@bootstrap_complete:true',
                   'G@roles:kube-minion']
+
+    new_etcd_nodes = []
+    remaining = num
     for role in prio_roles:
-        expr = ''
-        expr += 'not G@roles:etcd'
-        expr += ' and not G@roles:admin and not G@roles:ca'
-        expr += ' and not G@bootstrap_in_progress:true'
-        expr += ' and not G@update_in_progress:true'
-        expr += ' and not G@removal_in_progress:true'
-        expr += ' and {}'.format(role)
+        expr = const_expr + ' and {}'.format(role)
 
-        log.debug('CaaS: trying to find an etcd replacement with %s', expr)
-        ids = _get_grain(expr).keys()
+        log.debug('CaaS: trying to find candidates for running etcd with %s', expr)
+        ids = __salt__['caasp_grains.get'](expr).keys()
+        ids = [x for x in ids if x not in excluded]
         if len(ids) > 0:
-            log.debug('CaaS: ... candidates for replacement: %s', str(ids))
-            return ids[0]
+            log.debug('CaaS: ... %d candidates for running etcd: %s',
+                      len(ids), str(ids))
+            new_ids = ids[:remaining]
+            new_etcd_nodes = new_etcd_nodes + new_ids
+            remaining -= len(new_ids)
         else:
-            log.debug('CaaS: ... no candidates found')
+            log.debug('CaaS: ... no candidates found with %s', expr)
 
-    log.error('CaaS: no etcd replacement could be found')
-    return ''
+        if remaining <= 0:
+            break
+
+    log.error('CaaS: we were looking for %d etcd candidates and %d found',
+              num, len(new_etcd_nodes))
+    return new_etcd_nodes[:num]
 
 
-def get_additional_etcd_members():
+def get_additional_etcd_members(excluded=[]):
     '''
     Taking into account
 
@@ -163,7 +158,7 @@ def get_additional_etcd_members():
     get a list of additional nodes (IDs) that should run `etcd` too.
     '''
     # machine IDs in the cluster that are currently etcd servers
-    current_etcd_members = _get_grain('G@roles:etcd').keys()
+    current_etcd_members = __salt__['caasp_grains.get']('G@roles:etcd').keys()
     num_current_etcd_members = len(current_etcd_members)
 
     # the number of etcd masters that should be in the cluster
@@ -171,45 +166,13 @@ def get_additional_etcd_members():
     #... and the number we are missing
     num_additional_etcd_members = num_wanted_etcd_members - num_current_etcd_members
     log.debug(
-        'get_additional_etcd_members: curr:{} wanted:{} -> {} missing'.format(num_current_etcd_members, num_wanted_etcd_members, num_additional_etcd_members))
+        'CaaS: get_additional_etcd_members: curr:{} wanted:{} -> {} missing'.format(num_current_etcd_members, num_wanted_etcd_members, num_additional_etcd_members))
 
-    new_etcd_members = []
-
-    if num_additional_etcd_members > 0:
-
-        masters_no_etcd = _get_grain(
-            'G@roles:kube-master and not G@roles:etcd').keys()
-
-        # get k8s masters until we complete the etcd cluster
-        masters_and_etcd = masters_no_etcd[:num_additional_etcd_members]
-        new_etcd_members = new_etcd_members + masters_and_etcd
-        num_additional_etcd_members = num_additional_etcd_members - \
-            len(masters_and_etcd)
-        log.debug(
-            'CaaS: get_additional_etcd_members: taking {} masters -> {} missing'.format(len(masters_and_etcd), num_additional_etcd_members))
-
-        # if we have run out of k8s masters and we do not have
-        # enough etcd members, go for the k8s workers too...
-        if num_additional_etcd_members > 0:
-            workers_no_etcd = _get_grain(
-                'G@roles:kube-minion and not G@roles:etcd').keys()
-
-            workers_and_etcd = workers_no_etcd[:num_additional_etcd_members]
-            new_etcd_members = new_etcd_members + workers_and_etcd
-            num_additional_etcd_members = num_additional_etcd_members - \
-                len(workers_and_etcd)
-            log.debug(
-                'CaaS: get_additional_etcd_members: taking {} minions -> {} missing'.format(len(workers_and_etcd), num_additional_etcd_members))
-
-            # TODO: if num_additional_etcd_members is still >0,
-            #       fail/raise/message/something...
-            if num_additional_etcd_members > 0:
-                log.error(
-                    'CaaS: get_additional_etcd_members: cannot satisfy the {} members missing'.format(num_additional_etcd_members))
-
-            # TODO: go deeper and look for candidates in nodes with
-            #       no role (as get_replacement_for_member() does)
-
+    new_etcd_members = get_nodes_for_etcd(num_additional_etcd_members,
+                                          excluded=excluded)
+    if len(new_etcd_members) < num_additional_etcd_members:
+        log.error('CaaS: get_additional_etcd_members: cannot satisfy the {} members missing'.format(
+            num_additional_etcd_members))
     return new_etcd_members
 
 
@@ -228,7 +191,7 @@ def get_endpoints(with_id=False, skip_this=False, skip_removed=False, port=ETCD_
         expr += ' and not G@removal_in_progress:true'
 
     etcd_members_lst = []
-    for (node_id, name) in _get_grain(expr).items():
+    for (node_id, name) in __salt__['caasp_grains.get'](expr).items():
         if skip_this and name == _get_this_name():
             continue
         member_endpoint = 'https://{}:{}'.format(name, port)
