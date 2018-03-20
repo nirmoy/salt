@@ -6,7 +6,11 @@ apiVersion: extensions/v1beta1
 kind: PodSecurityPolicy
 metadata:
   name: privileged
-  annotations: {}
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfileNames: '*'
+    seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
+    apparmor.security.beta.kubernetes.io/allowedProfileNames: '*'
+    apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
 spec:
   # Privileged
   privileged: true
