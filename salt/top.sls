@@ -34,3 +34,4 @@ base:
     - container-feeder
     - kubelet
     - kube-proxy
+    - cilium
